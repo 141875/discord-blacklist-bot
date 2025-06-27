@@ -1,0 +1,112 @@
+import discord
+from discord.ext import commands
+from discord import app_commands, Embed
+import sqlite3
+import os
+from datetime import datetime
+
+conn = sqlite3.connect('blacklist.db')
+cursor = conn.cursor()
+
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS blacklist (
+    user_tag TEXT,
+    user_id TEXT,
+    type TEXT,
+    reason TEXT,
+    start_date TEXT,
+    end_date TEXT
+)
+''')
+conn.commit()
+
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix='/', intents=intents)
+tree = bot.tree
+
+ALLOWED_ROLES = ["Admin", "Moderator"]
+LOG_CHANNEL_ID = 123456789012345678  # Замени на ID твоего лог-канала
+
+@bot.event
+async def on_ready():
+    print(f'Бот запущен как {bot.user}')
+    try:
+        synced = await tree.sync()
+        print(f'Synced {len(synced)} команд.')
+    except Exception as e:
+        print(f'Ошибка при синхронизации: {e}')
+
+def has_permission(interaction: discord.Interaction):
+    return any(role.name in ALLOWED_ROLES for role in interaction.user.roles)
+
+def is_active(end_date):
+    if end_date is None or end_date.strip() == '' or end_date.lower() == 'бессрочно':
+        return True
+    try:
+        return datetime.strptime(end_date, '%Y-%m-%d') >= datetime.now()
+    except ValueError:
+        return True
+
+@tree.command(name="check", description="Проверить ЧС по Discord тэгу")
+async def check(interaction: discord.Interaction, user_tag: str):
+    cursor.execute("SELECT * FROM blacklist WHERE user_tag = ?", (user_tag,))
+    result = cursor.fetchall()
+
+    if not result:
+        await interaction.response.send_message(f'Пользователь {user_tag} не найден в ЧС.')
+    else:
+        embed = Embed(title=f'ЧС для {user_tag}', color=discord.Color.red())
+        for entry in result:
+            status = 'Активно' if is_active(entry[5]) else 'Истекло'
+            embed.add_field(name=f'Тип: {entry[2]} ({status})',
+                            value=f'Причина: {entry[3]}\nСрок: {entry[4]} до {entry[5] if entry[5] else "бессрочно"}',
+                            inline=False)
+        await interaction.response.send_message(embed=embed)
+
+@tree.command(name="add", description="Добавить пользователя в ЧС")
+async def add(interaction: discord.Interaction, user_tag: str, type: str, reason: str, start_date: str, end_date: str = None):
+    if not has_permission(interaction):
+        await interaction.response.send_message("У вас нет прав на выполнение этой команды.", ephemeral=True)
+        return
+
+    cursor.execute("INSERT INTO blacklist VALUES (?, ?, ?, ?, ?, ?)",
+                   (user_tag, 'Не указан', type.upper(), reason, start_date, end_date))
+    conn.commit()
+
+    await interaction.response.send_message(f'Пользователь {user_tag} добавлен в ЧС ({type.upper()}) по причине: {reason}.')
+    await log_action("Добавление в ЧС", interaction.user.name, user_tag)
+
+@tree.command(name="remove", description="Удалить пользователя из ЧС")
+async def remove(interaction: discord.Interaction, user_tag: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("У вас нет прав на выполнение этой команды.", ephemeral=True)
+        return
+
+    cursor.execute("DELETE FROM blacklist WHERE user_tag = ?", (user_tag,))
+    conn.commit()
+
+    await interaction.response.send_message(f'Пользователь {user_tag} удален из ЧС.')
+    await log_action("Удаление из ЧС", interaction.user.name, user_tag)
+
+@tree.command(name="history", description="Посмотреть историю пользователя в ЧС")
+async def history(interaction: discord.Interaction, user_tag: str):
+    cursor.execute("SELECT * FROM blacklist WHERE user_tag = ?", (user_tag,))
+    result = cursor.fetchall()
+
+    if not result:
+        await interaction.response.send_message(f'История для {user_tag} не найдена.')
+    else:
+        embed = Embed(title=f'История для {user_tag}', color=discord.Color.blue())
+        for entry in result:
+            status = 'Активно' if is_active(entry[5]) else 'Истекло'
+            embed.add_field(name=f'Тип: {entry[2]} ({status})',
+                            value=f'Причина: {entry[3]}\nСрок: {entry[4]} до {entry[5] if entry[5] else "бессрочно"}',
+                            inline=False)
+        await interaction.response.send_message(embed=embed)
+
+async def log_action(action: str, moderator: str, target: str):
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send(f'{action} | Модератор: {moderator} | Пользователь: {target}')
+
+bot.run(os.getenv('YOUR_BOT_TOKEN'))
